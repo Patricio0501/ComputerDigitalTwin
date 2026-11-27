@@ -1,0 +1,414 @@
+import sys
+import subprocess
+
+from rich.table import Table
+from rich import box
+from rich.prompt import Prompt, Confirm
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.console import Group as RichGroup
+from rich.text import Text as RichText
+
+from cli.display import (
+    console,
+    banner,
+    sub_banner,
+    error,
+    ok,
+    info,
+    separador,
+    con_progreso,
+    mostrar_resultado_ataque,
+    mostrar_reporte_incidente,
+    mostrar_grafo,
+)
+from config.settings import OS_CONFIGS, set_os
+from digital_twin import get_twin, init_twin
+from orchestrator.actions import (
+    seleccionar_os,
+    ejecutar_red_team,
+    ejecutar_extraccion_ms17,
+    restaurar_entorno,
+    ejecutar_simulacion,
+)
+
+os_actual = "Windows XP"
+
+
+def _simular(modo: str):
+    global os_actual
+    nombre = "Simulación Completa"
+    if modo == "vuln":
+        nombre += " (Evaluación CVEs)"
+    elif modo == "ms17-010-no-exfil":
+        nombre += " (MS17-010 sin extracción)"
+    elif modo == "ms17-010-extract":
+        nombre += " (MS17-010 con extracción)"
+
+    banner(nombre)
+
+    with con_progreso("Preparando infraestructura") as progress:
+        progress.add_task("", total=None)
+
+    separador("fase")
+    sub_banner("Fase 1: Preparación de Infraestructura")
+    info(f"Limpiando datos extraídos previos...")
+
+    with con_progreso("Arrancando VM") as progress:
+        progress.add_task("", total=None)
+
+    separador("fase")
+    sub_banner("Fase 2: Ataque y Defensa Simultáneos")
+    info(f"Red Team atacando '{os_actual}'...")
+    info("Blue Team monitoreando tráfico...")
+
+    result = ejecutar_simulacion(modo, os_actual)
+
+    if result.status == "error":
+        error(result.error_msg)
+        separador("fin")
+        return
+
+    separador("fase")
+    sub_banner("Fase 3: Análisis Forense (IA)")
+
+    if result.status == "warning":
+        info(result.error_msg)
+        separador("fin")
+        return
+
+    mostrar_reporte_incidente(
+        result.llm_response,
+        result.cvss_score,
+        result.cvss_nivel,
+        result.os_name,
+    )
+
+    if result.report_data:
+        from cli.export_menu import select_export_format
+
+        option = select_export_format()
+        if option in ("1", "3"):
+            from reports.exporter import PDFExporter
+
+            PDFExporter.export(result.report_data)
+        if option in ("2", "3"):
+            from reports.csv_exporter import CSVExporter
+
+            CSVExporter.export(result.report_data)
+
+        if Confirm.ask("[bold cyan]¿Abrir chat con el agente SOC para consultar sobre el reporte?[/]", default=True):
+            from cli.chat_agent import iniciar_chat
+
+            iniciar_chat(result.report_data)
+
+    separador("fin")
+
+
+def _red_team_solo(modo: str, titulo: str):
+    global os_actual
+    banner(titulo)
+    result = ejecutar_red_team(modo, os_actual)
+    mostrar_resultado_ataque(result)
+    separador("fin")
+
+
+# ----------------------------------------------------------------
+# Menú principal: selección de SO
+# ----------------------------------------------------------------
+def _pantalla_seleccion_so() -> str | None:
+    console.print("\n" * 2)
+    banner("COMPUTER DIGITAL TWIN — Selección de Sistema Operativo")
+    console.print()
+
+    ops = list(OS_CONFIGS.keys())
+    table = Table(box=box.SIMPLE_HEAD, border_style="cyan")
+    table.add_column("#", style="bold yellow", width=3)
+    table.add_column("Sistema Operativo", style="white")
+    table.add_column("VM", style="dim")
+    table.add_column("IP", style="dim")
+
+    for i, nombre in enumerate(ops, 1):
+        cfg = OS_CONFIGS[nombre]
+        table.add_row(str(i), nombre, cfg["VM_NAME"], cfg["TARGET_IP"])
+
+    table.add_row("R", "[bold green]Restaurar todas las VMs[/]", "", "")
+    table.add_row("0", "[bold red]Salir[/]", "", "")
+    console.print(table)
+
+    opcion = Prompt.ask(
+        "\n[bold cyan]Elige un sistema operativo[/]", default="", show_default=False
+    )
+
+    if opcion.lower() == "r":
+        from Infraestructura.vm_manager import restore_snapshot, start_vm
+        from orchestrator.actions import limpiar_exfil
+
+        banner("Restaurando todas las VMs", "bold green")
+        errores = []
+        for nombre, cfg in OS_CONFIGS.items():
+            info(f"Restaurando {nombre} ({cfg['VM_NAME']})...")
+            try:
+                with con_progreso(f"Restaurando {cfg['VM_NAME']}") as progress:
+                    progress.add_task("", total=None)
+                    restore_snapshot(cfg["VM_NAME"], cfg["SNAPSHOT"])
+                    start_vm(cfg["VM_NAME"])
+                ok(f"{nombre} restaurada e iniciada.")
+            except Exception as e:
+                error(f"{nombre}: {e}")
+                errores.append(nombre)
+        limpiar_exfil()
+        if not errores:
+            ok("Todas las VMs restauradas exitosamente.")
+        else:
+            error(f"Fallaron: {', '.join(errores)}")
+        separador("fin")
+        return None
+
+    if opcion == "0":
+        sys.exit(0)
+
+    try:
+        idx = int(opcion)
+        if 1 <= idx <= len(ops):
+            nombre = ops[idx - 1]
+            set_os(nombre)
+            return nombre
+    except ValueError:
+        pass
+
+    error("Opción inválida.")
+    return None
+
+
+# ----------------------------------------------------------------
+# Menú de acciones (por SO)
+# ----------------------------------------------------------------
+_pantalla_accion_items: list[tuple[str, str]] = [
+    ("1", "Restaurar todo (VM + limpiar datos extraídos)"),
+    ("", "[bold]--- Ataques Red Team (individuales) ---[/]"),
+    ("2", "Ataque Básico"),
+    ("3", "Evaluación de Vulnerabilidades / CVEs"),
+    ("4", "MS17-010 Checker (EternalBlue)"),
+    ("5", "MS17-010 Exploit (sin extracción)"),
+    ("6", "MS17-010 Extracción de Archivos"),
+    ("", "[bold]--- Simulaciones Completas (Red + Blue) ---[/]"),
+    ("7", "Ataque Básico + SOC"),
+    ("8", "Ataque con CVEs + SOC"),
+    ("9", "MS17-010 sin exfiltración + SOC"),
+    ("10", "MS17-010 con exfiltración + SOC"),
+    ("", "[bold]--- Digital Twin ---[/]"),
+    ("11", "Ver grafo de infraestructura"),
+    ("12", "Exportar grafo (JSON)"),
+    ("", "[bold]--- ---[/]"),
+    ("13", "Volver (cambiar sistema operativo)"),
+    ("0", "Salir"),
+]
+
+
+_explicaciones: dict[str, tuple[str, str, str | None]] = {
+    "2": (
+        "Escaneo de Puertos (nmap TCP Connect)",
+        "Realiza un escaneo TCP Connect (-sT) para descubrir puertos abiertos en el sistema objetivo. "
+        "Se aplican técnicas de evasión: fragmentación de paquetes (-f), "
+        "puerto origen DNS (-g 53, suele estar permitido), "
+        "longitud de datos aleatoria (--data-length 24) y spoofing de MAC (--spoof-mac 0). "
+        "Velocidad máxima (-T5) para acelerar el escaneo.",
+        "sudo nmap -Pn -sT -f -g 53 -T5 --data-length 24 --spoof-mac 0 -p <puertos> --open <target_ip>",
+    ),
+    "3": (
+        "Evaluación de Vulnerabilidades (nmap NSE)",
+        "Ejecuta un escaneo de vulnerabilidades con el Nmap Scripting Engine (NSE). "
+        "Incluye detección de versiones de servicios (-sV) y ejecuta scripts de vulnerabilidades "
+        "conocidas (--script vuln,smb-vuln*). Especialmente efectivo contra servicios SMB/NetBIOS "
+        "en sistemas Windows. Se aplican las mismas técnicas de evasión que el escaneo básico.",
+        "sudo nmap -Pn -sT -sV -f -g 53 -T5 --data-length 24 --spoof-mac 0 -p <puertos> --script vuln,smb-vuln* <target_ip>",
+    ),
+    "4": (
+        "MS17-010 Checker (EternalBlue)",
+        "Verifica si el objetivo es vulnerable al exploit EternalBlue (CVE-2017-0144). "
+        "Se conecta al puerto SMB (445) y envía una transacción especial TRANS_PEEK_NMPIPE. "
+        "Si el sistema retorna STATUS_INVALID_PARAMETER (0xC0000205), es vulnerable. "
+        "También enumera los named pipes accesibles de forma anónima.",
+        None,
+    ),
+    "5": (
+        "MS17-010 Exploit (sin extracción)",
+        "Ejecuta el exploit EternalBlue que aprovecha un desbordamiento de búfer en SMBv1 "
+        "(CVE-2017-0144). Mediante una escritura fuera de los límites (OOB write) en el kernel "
+        "de Windows, obtiene acceso como SYSTEM en el equipo víctima. En esta modalidad "
+        "no se extraen archivos del sistema.",
+        None,
+    ),
+    "6": (
+        "MS17-010 Extracción de Archivos",
+        "Ejecuta el exploit EternalBlue para obtener acceso SYSTEM y luego extrae datos sensibles "
+        "del usuario (cookies de navegador, historial, archivos del escritorio) a través de SMB. "
+        "Si hay credenciales configuradas, extrae directamente sin exploit. "
+        "Los archivos se guardan en el directorio Telemetria/exfil/.",
+        None,
+    ),
+    "7": (
+        "Ataque Básico + SOC",
+        "Realiza un escaneo TCP Connect (-sT) con nmap mientras el Blue Team captura el tráfico "
+        "de red con tcpdump. Luego, un analista SOC basado en IA (DeepSeek) analiza los logs "
+        "para clasificar la amenaza, calcular su puntuación CVSS 3.1 y generar "
+        "recomendaciones de mitigación detalladas.",
+        "sudo nmap -Pn -sT -f -g 53 -T5 --data-length 24 --spoof-mac 0 -p <puertos> --open <target_ip>",
+    ),
+    "8": (
+        "Ataque con CVEs + SOC",
+        "Ejecuta un escaneo de vulnerabilidades con nmap NSE (--script vuln,smb-vuln*) mientras "
+        "el Blue Team captura el tráfico con tcpdump. La IA clasifica la amenaza, "
+        "calcula CVSS y genera un reporte forense con explicación técnica y mitigaciones.",
+        "sudo nmap -Pn -sT -sV -f -g 53 -T5 --data-length 24 --spoof-mac 0 -p <puertos> --script vuln,smb-vuln* <target_ip>",
+    ),
+    "9": (
+        "MS17-010 sin exfiltración + SOC",
+        "Ejecuta el exploit EternalBlue contra el objetivo vulnerable mientras el Blue Team "
+        "captura el tráfico SMB con tcpdump. La IA analiza la actividad de red para detectar "
+        "la explotación y genera un reporte forense completo con CVSS y mitigaciones.",
+        None,
+    ),
+    "10": (
+        "MS17-010 con exfiltración + SOC",
+        "Ejecuta el exploit EternalBlue y extrae archivos sensibles del usuario, todo mientras "
+        "el Blue Team captura el tráfico de red. La IA analiza los logs para detectar tanto "
+        "la explotación como la exfiltración, generando un reporte completo.",
+        None,
+    ),
+}
+
+
+def _mostrar_explicacion(opcion: str):
+    if opcion not in _explicaciones:
+        return
+    titulo, descripcion, comando = _explicaciones[opcion]
+    elements = [descripcion]
+    if comando:
+        elements.append(RichText(""))
+        elements.append(
+            Syntax(comando, "bash", theme="monokai", word_wrap=True)
+        )
+    panel = Panel(
+        RichGroup(*elements),
+        title=f"[bold cyan]⚡ {titulo}[/]",
+        border_style="cyan",
+        box=box.ROUNDED,
+    )
+    console.print(panel)
+
+
+def _mostrar_pantalla_acciones():
+    console.print("\n" * 2)
+    banner(f"COMPUTER DIGITAL TWIN — [bold white]{os_actual}[/]")
+    console.print()
+
+    table = Table(box=box.SIMPLE_HEAD, border_style="cyan")
+    table.add_column("#", style="bold yellow", width=3)
+    table.add_column("Acción", style="white")
+
+    for key, desc in _pantalla_accion_items:
+        if not key:
+            table.add_row("", f"[dim]{desc}[/]")
+        else:
+            table.add_row(key, desc)
+
+    console.print(table)
+    return Prompt.ask(
+        "\n[bold cyan]Elige una opción[/]", default="", show_default=False
+    )
+
+
+def pantalla_acciones():
+    global os_actual
+
+    while True:
+        opcion = _mostrar_pantalla_acciones()
+        _mostrar_explicacion(opcion)
+
+        if opcion == "0":
+            banner("Saliendo...", "bold red")
+            sys.exit(0)
+
+        elif opcion == "1":
+            banner("Restauración del Entorno")
+            with con_progreso("Restaurando VM") as progress:
+                progress.add_task("", total=None)
+            result = restaurar_entorno(os_actual)
+            ok("Restauración completada.")
+            separador("fin")
+
+        elif opcion == "2":
+            _red_team_solo("normal", "Red Team — Ataque Básico")
+        elif opcion == "3":
+            _red_team_solo("vuln", "Red Team — Evaluación de Vulnerabilidades")
+        elif opcion == "4":
+            _red_team_solo("ms17-010", "Red Team — MS17-010 Checker")
+        elif opcion == "5":
+            _red_team_solo(
+                "ms17-010-no-exfil", "Red Team — MS17-010 Exploit (sin extracción)"
+            )
+
+        elif opcion == "6":
+            banner("Red Team — MS17-010 Extracción de Archivos")
+            result = ejecutar_extraccion_ms17(os_actual)
+            mostrar_resultado_ataque(result)
+            separador("fin")
+
+        elif opcion == "7":
+            _simular("normal")
+        elif opcion == "8":
+            _simular("vuln")
+        elif opcion == "9":
+            _simular("ms17-010-no-exfil")
+        elif opcion == "10":
+            _simular("ms17-010-extract")
+
+        elif opcion == "11":
+            dt = get_twin()
+            if dt.graph.number_of_nodes() == 0:
+                dt = init_twin(OS_CONFIGS)
+            mostrar_grafo(dt)
+            separador("fin")
+
+        elif opcion == "12":
+            dt = get_twin()
+            if dt.graph.number_of_nodes() == 0:
+                dt = init_twin(OS_CONFIGS)
+            from datetime import datetime
+            import json
+
+            path = f"reports/output/digital_twin_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(path, "w") as f:
+                json.dump(dt.to_json_serializable(), f, indent=2)
+            ok(f"Grafo exportado a: {path}")
+            separador("fin")
+
+        elif opcion == "13":
+            nuevo = _pantalla_seleccion_so()
+            if nuevo:
+                os_actual = nuevo
+                ok(f"SO cambiado a: {os_actual}")
+            else:
+                pass
+
+        else:
+            error("Opción inválida. Intenta nuevamente.")
+
+
+def menu_interactivo():
+    global os_actual
+    try:
+        subprocess.run(["sudo", "-v"], check=True)
+    except subprocess.CalledProcessError:
+        error(
+            "No se pudo validar sudo. Ejecutá './cdt.sh' para lanzar el programa con permisos temporales."
+        )
+
+    while True:
+        seleccion = _pantalla_seleccion_so()
+        if seleccion:
+            os_actual = seleccion
+            pantalla_acciones()
+        # si no hay selección válida, el loop lo reintenta
